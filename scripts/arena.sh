@@ -22,7 +22,12 @@ DIM='\033[2m'
 RESET='\033[0m'
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
-MODEL_A="claude"
+# Defaults: compare two OpenAI models via codex CLI (works headless/root)
+# For Claude vs Codex on non-root systems, use: --model-a claude --model-b codex
+# Default: gpt-5.2 vs gpt-5.3-codex. Use --model-a/--model-b to change.
+# Note: On ChatGPT-based Codex accounts, only gpt-5.2 and gpt-5.3-codex work.
+# On API accounts, o3/o4-mini also work. For Claude models, use --model-a claude (non-root only).
+MODEL_A="gpt-5.2"
 MODEL_B="codex"
 JUDGE_MODEL="claude"
 TIMEOUT=600
@@ -255,25 +260,35 @@ build_agent_cmd() {
     local model="$1"
     local worktree="$2"
     local cli model_flag
+    local full_task="${TASK}. You MUST write all code to files in the current directory. Do NOT just describe what to build — actually create the files with working code. After writing files, run: git add -A && git commit -m 'arena submission'"
 
     cli="$(resolve_cli "$model")"
     model_flag="$(resolve_model_flag "$model")"
 
     case "$cli" in
         claude)
-            local cmd="cd '$worktree' && claude --print --dangerously-skip-permissions"
-            if [[ -n "$model_flag" ]]; then
-                cmd="$cmd --model '$model_flag'"
+            if [[ "$(id -u)" == "0" ]]; then
+                # Running as root: claude --dangerously-skip-permissions is blocked
+                # Use claude in headless mode with --yes flag
+                local cmd="cd '$worktree' && claude -p '${full_task//\'/\'\\\'\'}' --output-format text"
+                if [[ -n "$model_flag" ]]; then
+                    cmd="cd '$worktree' && claude -p '${full_task//\'/\'\\\'\'}' --model '$model_flag' --output-format text"
+                fi
+            else
+                local cmd="cd '$worktree' && claude --dangerously-skip-permissions"
+                if [[ -n "$model_flag" ]]; then
+                    cmd="$cmd --model '$model_flag'"
+                fi
+                cmd="$cmd -p '${full_task//\'/\'\\\'\'}'"
             fi
-            cmd="$cmd '$TASK'"
             echo "$cmd"
             ;;
         codex)
-            local cmd="cd '$worktree' && codex --full-auto --quiet"
+            local cmd="cd '$worktree' && codex exec --full-auto"
             if [[ -n "$model_flag" ]]; then
                 cmd="$cmd --model '$model_flag'"
             fi
-            cmd="$cmd '$TASK'"
+            cmd="$cmd '${full_task//\'/\'\\\'\'}'"
             echo "$cmd"
             ;;
     esac
@@ -286,13 +301,32 @@ CMD_B="$(build_agent_cmd "$MODEL_B" "$WORKTREE_B")"
 log_step "Launching agents in parallel via tmux..."
 
 # Agent A
+# Write agent commands to scripts to avoid quoting hell in tmux
+cat > "$ARENA_DIR/run-a.sh" <<SCRIPT_A
+#!/usr/bin/env bash
+set -e
+${CMD_A}
+echo "EXIT_CODE=\$?" > "$ARENA_DIR/status-a.txt"
+echo DONE
+SCRIPT_A
+chmod +x "$ARENA_DIR/run-a.sh"
+
+cat > "$ARENA_DIR/run-b.sh" <<SCRIPT_B
+#!/usr/bin/env bash
+set -e
+${CMD_B}
+echo "EXIT_CODE=\$?" > "$ARENA_DIR/status-b.txt"
+echo DONE
+SCRIPT_B
+chmod +x "$ARENA_DIR/run-b.sh"
+
 tmux new-session -d -s "$TMUX_SESSION_A" -x 200 -y 50 \
-    "bash -c '${CMD_A}; echo \"\nEXIT_CODE=\$?\" > \"$ARENA_DIR/status-a.txt\"; echo DONE' 2>&1 | tee '$ARENA_DIR/output-a.log'"
+    "bash '$ARENA_DIR/run-a.sh' 2>&1 | tee '$ARENA_DIR/output-a.log'"
 log_ok "Agent A running in tmux session: ${TMUX_SESSION_A}"
 
 # Agent B
 tmux new-session -d -s "$TMUX_SESSION_B" -x 200 -y 50 \
-    "bash -c '${CMD_B}; echo \"\nEXIT_CODE=\$?\" > \"$ARENA_DIR/status-b.txt\"; echo DONE' 2>&1 | tee '$ARENA_DIR/output-b.log'"
+    "bash '$ARENA_DIR/run-b.sh' 2>&1 | tee '$ARENA_DIR/output-b.log'"
 log_ok "Agent B running in tmux session: ${TMUX_SESSION_B}"
 
 echo ""
@@ -356,11 +390,15 @@ log_ok "Both agents finished"
 log_step "Collecting diffs..."
 
 # Stage all changes in each worktree so we capture new files
-(cd "$WORKTREE_A" && git add -A && git diff --cached --stat) > "$ARENA_DIR/stat-a.txt" 2>/dev/null || true
-(cd "$WORKTREE_B" && git add -A && git diff --cached --stat) > "$ARENA_DIR/stat-b.txt" 2>/dev/null || true
+# Collect any uncommitted changes first, then diff against base
+(cd "$WORKTREE_A" && git add -A && git diff --cached --quiet || git commit -m "arena: auto-commit unstaged changes" 2>/dev/null) || true
+(cd "$WORKTREE_B" && git add -A && git diff --cached --quiet || git commit -m "arena: auto-commit unstaged changes" 2>/dev/null) || true
 
-DIFF_A="$(cd "$WORKTREE_A" && git add -A && git diff --cached 2>/dev/null || echo '(no changes)')"
-DIFF_B="$(cd "$WORKTREE_B" && git add -A && git diff --cached 2>/dev/null || echo '(no changes)')"
+BASE_COMMIT="$(cd "$REPO_DIR" && git rev-parse "${BASE_REF}" 2>/dev/null)"
+DIFF_A="$(cd "$WORKTREE_A" && git diff "${BASE_COMMIT}..HEAD" 2>/dev/null || echo '(no changes)')"
+DIFF_B="$(cd "$WORKTREE_B" && git diff "${BASE_COMMIT}..HEAD" 2>/dev/null || echo '(no changes)')"
+(cd "$WORKTREE_A" && git diff "${BASE_COMMIT}..HEAD" --stat) > "$ARENA_DIR/stat-a.txt" 2>/dev/null || true
+(cd "$WORKTREE_B" && git diff "${BASE_COMMIT}..HEAD" --stat) > "$ARENA_DIR/stat-b.txt" 2>/dev/null || true
 
 # Truncate huge diffs for the judge (keep first 15000 chars)
 MAX_DIFF=15000
